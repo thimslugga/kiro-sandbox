@@ -1,0 +1,44 @@
+{
+  "$schema": "https://json.schemastore.org/kiro-agent.json",
+  "name": "sandbox-default",
+  "description": "Default agent for use inside kiro-sandbox. Logs every shell command, AWS call, and file write to ~/.local/share/kiro-sandbox/log/tool-calls.log. Read-only by default.",
+
+  "_comment_tools": "Read-only tools are pre-approved. Write tools require explicit approval each time so a hijacked prompt cannot silently mutate files. Loosen by editing this file or by approving at runtime.",
+
+  "tools": [
+    "fs_read",
+    "execute_bash",
+    "use_aws"
+  ],
+  "allowedTools": [
+    "fs_read"
+  ],
+
+  "_comment_hooks": "Hooks run on the sandbox's HOME view, so /home/$USER/.local/share/kiro-sandbox/log/ resolves to the wrapper's persistent log directory because the sandbox HOME is bound from there. The 'cat' reads the tool input as JSON on stdin; we capture it verbatim plus a timestamp.",
+
+  "hooks": {
+    "agentSpawn": [
+      {
+        "command": "printf '%s [agent-spawn] cwd=%s\\n' \"$(date -Iseconds)\" \"$PWD\" >> \"$HOME/.local/share/kiro-cli/log/tool-calls.log\""
+      }
+    ],
+    "preToolUse": [
+      {
+        "matcher": "execute_bash",
+        "command": "{ printf '%s [bash]\\n' \"$(date -Iseconds)\"; cat; printf '\\n'; } >> \"$HOME/.local/share/kiro-cli/log/tool-calls.log\""
+      },
+      {
+        "matcher": "use_aws",
+        "command": "{ printf '%s [aws]\\n' \"$(date -Iseconds)\"; cat; printf '\\n'; } >> \"$HOME/.local/share/kiro-cli/log/tool-calls.log\""
+      },
+      {
+        "matcher": "fs_write",
+        "command": "{ printf '%s [fs_write]\\n' \"$(date -Iseconds)\"; cat; printf '\\n'; } >> \"$HOME/.local/share/kiro-cli/log/tool-calls.log\""
+      }
+    ]
+  },
+
+  "includeMcpJson": false,
+  "mcpServers": {}
+}
+

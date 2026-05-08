@@ -1,0 +1,335 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# kiro-sandbox - Run kiro-cli inside a bubblewrap sandbox.
+#
+# Confines kiro-cli to a dedicated isolated $HOME plus the current
+# working directory. Blocks access to ~/.ssh, ~/.gnupg, browser
+# profiles, password managers, shell history, and other projects.
+# Auth state, settings, and chat history live in a sandbox-only home
+# under $XDG_DATA_HOME/kiro-sandbox/home so they persist across runs
+# without touching your real ~/.kiro.
+#
+# Usage:
+#   kiro-sandbox [args passed to kiro-cli]
+#   kiro-sandbox chat
+#   kiro-sandbox login
+#   kiro-sandbox --shell           # drop into a bash shell in the sandbox
+#   kiro-sandbox --exec CMD [ARGS] # run an arbitrary command in the sandbox
+#   kiro-sandbox --help
+#
+# Toggles (environment variables, default values shown):
+#   KIRO_SANDBOX_HOME=$XDG_DATA_HOME/kiro-sandbox
+#                          Override the sandbox state directory.
+#   KIRO_SANDBOX_NO_NET=0  Set to 1 to drop the network namespace.
+#   KIRO_SANDBOX_NO_AWS=0  Set to 1 to NOT bind ~/.aws into sandbox.
+#   KIRO_SANDBOX_EPHEMERAL=0
+#                          Set to 1 for a tmpfs HOME with no
+#                          persistence. Forces re-login each time.
+#   KIRO_SANDBOX_SHARE_GIT=1
+#                          Bind ~/.gitconfig and ~/.config/git RO.
+#   KIRO_SANDBOX_EXTRA_RO=""
+#                          Colon-separated extra read-only binds.
+#   KIRO_SANDBOX_EXTRA_RW=""
+#                          Colon-separated extra read-write binds.
+#   KIRO_SANDBOX_SECCOMP=1 Set to 0 to skip the seccomp filter.
+#                          Default: enabled if python3-libseccomp is
+#                          available, otherwise warned and skipped.
+#   KIRO_SANDBOX_VERBOSE=0 Set to 1 to print the assembled bwrap command.
+
+real_user=$(id -un)
+real_uid=$(id -u)
+real_home=${HOME:?HOME is unset}
+xdg_data=${XDG_DATA_HOME:-$real_home/.local/share}
+sandbox_root=${KIRO_SANDBOX_HOME:-$xdg_data/kiro-sandbox}
+sandbox_home=$sandbox_root/home
+sandbox_log=$sandbox_root/log
+
+# Resolve the directory this script lives in (handles symlinks)
+script_path=$(readlink -f -- "$0")
+script_dir=$(dirname -- "$script_path")
+seccomp_gen="$script_dir/kiro-sandbox-seccomp"
+
+# Toggles
+no_net=${KIRO_SANDBOX_NO_NET:-0}
+no_aws=${KIRO_SANDBOX_NO_AWS:-0}
+ephemeral=${KIRO_SANDBOX_EPHEMERAL:-0}
+share_git=${KIRO_SANDBOX_SHARE_GIT:-1}
+verbose=${KIRO_SANDBOX_VERBOSE:-0}
+use_seccomp=${KIRO_SANDBOX_SECCOMP:-1}
+extra_ro=${KIRO_SANDBOX_EXTRA_RO:-}
+extra_rw=${KIRO_SANDBOX_EXTRA_RW:-}
+
+mode=run
+exec_argv=()
+
+die() {
+  printf 'kiro-sandbox: %s\n' "$*" >&2
+  exit 1
+}
+
+note() {
+  [[ "$verbose" = 1 ]] && printf 'kiro-sandbox: %s\n' "$*" >&2 || true
+}
+
+case "${1:-}" in
+-h | --help)
+  sed -n '2,/^set -e/{ /^set -e/d; s/^# \?//; p; }' "$script_path"
+  exit 0
+  ;;
+--shell | --debug-shell)
+  mode=shell
+  shift
+  ;;
+--exec)
+  mode=exec
+  shift
+  [ "$#" -gt 0 ] || die "--exec requires a command"
+  exec_argv=("$@")
+  set --
+  ;;
+esac
+
+# Requirements
+command -v bwrap >/dev/null 2>&1 || die "bwrap not found. Install bubblewrap: dnf install bubblewrap"
+command -v python3 >/dev/null 2>&1 || die "bwrap not found. Install python: dnf install python3"
+
+kiro_bin=$(command -v kiro-cli 2>/dev/null || true)
+if [ "$mode" = run ]; then
+  [ -n "$kiro_bin" ] || die "kiro-cli not found in PATH"
+fi
+if [ -n "$kiro_bin" ]; then
+  kiro_real=$(readlink -f -- "$kiro_bin")
+  kiro_install_dir=$(dirname -- "$kiro_real")
+  note "kiro-cli resolved to: $kiro_real"
+else
+  kiro_real=""
+  kiro_install_dir=""
+fi
+
+# Locate kiro support directory
+kiro_share=""
+for cand in \
+  "$real_home/.local/share/kiro-cli" \
+  "/usr/share/kiro-cli" \
+  "/opt/kiro-cli"; do
+  if [ -d "$cand" ]; then
+    kiro_share=$cand
+    break
+  fi
+done
+note "kiro support dir: ${kiro_share:-<none found>}"
+
+# Lazy initialization of sandbox state
+if [ "$ephemeral" != 1 ]; then
+  mkdir -p -- "$sandbox_home" "$sandbox_log"
+  chmod 700 -- "$sandbox_root"
+  mkdir -p -- \
+    "$sandbox_home/.kiro" \
+    "$sandbox_home/.config" \
+    "$sandbox_home/.cache" \
+    "$sandbox_home/.local/share"
+fi
+
+# Seccomp filter
+# Open FD 10 reading from the seccomp generator. bwrap inherits FD 10
+# across the upcoming exec and reads the BPF program from it.
+seccomp_active=0
+if [ "$use_seccomp" = 1 ]; then
+  if [ ! -f "$seccomp_gen" ]; then
+    note "seccomp filter skipped: $seccomp_gen not found"
+  elif ! command -v python3 >/dev/null 2>&1; then
+    note "seccomp filter skipped: python3 not in PATH"
+  elif ! python3 -c 'import seccomp' 2>/dev/null; then
+    printf 'kiro-sandbox: warning: python3 libseccomp bindings not installed; running without seccomp filter\n' >&2
+    printf '  Fedora/AL2023: dnf install -y python3 python3-libseccomp\n' >&2
+    printf '  Debian/Ubuntu: apt install -y python3 python3-seccomp\n' >&2
+  else
+    # The python helper writes BPF to stdout; status to stderr.
+    exec 10< <(python3 -- "$seccomp_gen")
+    seccomp_active=1
+  fi
+fi
+
+# Build bwrap argument list
+args=()
+
+# System tree (read-only)
+args+=(--ro-bind /usr /usr)
+args+=(--symlink usr/bin /bin)
+args+=(--symlink usr/sbin /sbin)
+args+=(--symlink usr/lib /lib)
+[ -e /lib64 ] && args+=(--symlink usr/lib64 /lib64)
+
+# /etc (resolv.conf, ca-certificates, passwd, etc)
+args+=(--ro-bind /etc /etc)
+
+# /opt (some packages live here)
+args+=(--ro-bind-try /opt /opt)
+
+# Required virtual filesystems
+args+=(--proc /proc)
+args+=(--dev /dev)
+
+# Writable scratch areas
+args+=(--tmpfs /tmp)
+args+=(--tmpfs /var)
+args+=(--dir /run)
+args+=(--dir "/run/user/$real_uid")
+
+# Sandbox HOME (overlays the real one)
+if [ "$ephemeral" = 1 ]; then
+  args+=(--tmpfs "$real_home")
+else
+  args+=(--bind "$sandbox_home" "$real_home")
+fi
+
+# Make kiro-cli binary visible if it lives under $HOME
+if [ -n "$kiro_install_dir" ]; then
+  case "$kiro_install_dir" in
+  "$real_home"/*)
+    args+=(--ro-bind "$kiro_install_dir" "$kiro_install_dir")
+    ;;
+  esac
+fi
+if [ -n "$kiro_share" ]; then
+  case "$kiro_share" in
+  "$real_home"/*)
+    args+=(--ro-bind "$kiro_share" "$kiro_share")
+    ;;
+  esac
+fi
+
+# Optional: Share AWS credentials (rw because SSO writes token cache)
+if [ "$no_aws" != 1 ] && [ -d "$real_home/.aws" ]; then
+  args+=(--bind "$real_home/.aws" "$real_home/.aws")
+  note "AWS credentials shared (rw)"
+fi
+
+# Optional: Share git config (read-only)
+if [ "$share_git" = 1 ]; then
+  [ -f "$real_home/.gitconfig" ] &&
+    args+=(--ro-bind "$real_home/.gitconfig" "$real_home/.gitconfig")
+  [ -d "$real_home/.config/git" ] &&
+    args+=(--ro-bind "$real_home/.config/git" "$real_home/.config/git")
+fi
+
+# The current project directory: bind it at the same path so all
+# paths kiro-cli sees match what you would type outside.
+project_dir=$(pwd -P)
+if [ "$project_dir" != "$real_home" ]; then
+  args+=(--bind "$project_dir" "$project_dir")
+  note "project dir: $project_dir (rw)"
+fi
+
+# Extra user-supplied binds
+if [ -n "$extra_ro" ]; then
+  IFS=':' read -r -a paths <<<"$extra_ro"
+  for p in "${paths[@]}"; do
+    [ -n "$p" ] && [ -e "$p" ] && args+=(--ro-bind "$p" "$p")
+  done
+fi
+if [ -n "$extra_rw" ]; then
+  IFS=':' read -r -a paths <<<"$extra_rw"
+  for p in "${paths[@]}"; do
+    [ -n "$p" ] && [ -e "$p" ] && args+=(--bind "$p" "$p")
+  done
+fi
+
+# Namespace isolation and hardening
+args+=(--unshare-all)
+[ "$no_net" != 1 ] && args+=(--share-net)
+args+=(--new-session)     # blocks TIOCSTI keystroke injection
+args+=(--die-with-parent) # SIGKILL sandbox if wrapper dies
+args+=(--cap-drop ALL)
+args+=(--disable-userns)         # no nested user namespaces
+args+=(--assert-userns-disabled) # belt and suspenders
+
+# Seccomp filter (FD 10 opened above)
+if [ "$seccomp_active" = 1 ]; then
+  args+=(--seccomp 10)
+  note "seccomp filter applied (fd 10)"
+fi
+
+# Clean environment (whitelist what gets through)
+args+=(--clearenv)
+args+=(--setenv HOME "$real_home")
+args+=(--setenv USER "$real_user")
+args+=(--setenv LOGNAME "$real_user")
+args+=(--setenv PATH "/usr/local/bin:/usr/bin:/usr/sbin${kiro_install_dir:+:$kiro_install_dir}")
+args+=(--setenv TERM "${TERM:-xterm-256color}")
+args+=(--setenv LANG "${LANG:-C.UTF-8}")
+args+=(--setenv XDG_RUNTIME_DIR "/run/user/$real_uid")
+args+=(--setenv XDG_DATA_HOME "$real_home/.local/share")
+args+=(--setenv XDG_CONFIG_HOME "$real_home/.config")
+args+=(--setenv XDG_CACHE_HOME "$real_home/.cache")
+
+[ -n "${COLORTERM:-}" ] && args+=(--setenv COLORTERM "$COLORTERM")
+[ -n "${NO_COLOR:-}" ] && args+=(--setenv NO_COLOR "$NO_COLOR")
+
+# Editor preference (nvim > vim > vi, never nano)
+if command -v nvim >/dev/null 2>&1; then
+  args+=(--setenv EDITOR nvim --setenv VISUAL nvim)
+elif command -v vim >/dev/null 2>&1; then
+  args+=(--setenv EDITOR vim --setenv VISUAL vim)
+elif command -v vi >/dev/null 2>&1; then
+  args+=(--setenv EDITOR vi --setenv VISUAL vi)
+fi
+
+# Forward AWS profile/region selection if set on the host
+for v in AWS_PROFILE AWS_REGION AWS_DEFAULT_REGION AWS_CONFIG_FILE \
+  AWS_SHARED_CREDENTIALS_FILE; do
+  if [ -n "${!v:-}" ]; then
+    args+=(--setenv "$v" "${!v}")
+  fi
+done
+
+# Shell mode gets a recognizable prompt
+if [ "$mode" = shell ]; then
+  args+=(--setenv PS1 '[kiro-sandbox \W]\$ ')
+fi
+
+# Working directory inside the sandbox
+args+=(--chdir "$project_dir")
+
+# Audit log
+if [ "$ephemeral" != 1 ]; then
+  printf '%s pid=%s mode=%s pwd=%s seccomp=%s argv=%s\n' \
+    "$(date -Iseconds)" "$$" "$mode" "$project_dir" "$seccomp_active" "$*" \
+    >>"$sandbox_log/invocations.log" 2>/dev/null || true
+fi
+
+# Verbose dump
+if [ "$verbose" = 1 ]; then
+  printf '+ bwrap' >&2
+  for a in "${args[@]}"; do
+    printf ' %q' "$a" >&2
+  done
+  case "$mode" in
+  shell)
+    printf ' /usr/bin/env bash --norc -i\n' >&2
+    ;;
+  exec)
+    for a in "${exec_argv[@]}"; do printf ' %q' "$a" >&2; done
+    printf '\n' >&2
+    ;;
+  run)
+    printf ' %q' "$kiro_real" >&2
+    for a in "$@"; do printf ' %q' "$a" >&2; done
+    printf '\n' >&2
+    ;;
+  esac
+fi
+
+# Exec
+case "$mode" in
+shell)
+  exec bwrap "${args[@]}" /usr/bin/env bash --norc -i
+  ;;
+exec)
+  exec bwrap "${args[@]}" "${exec_argv[@]}"
+  ;;
+run)
+  exec bwrap "${args[@]}" "$kiro_real" "$@"
+  ;;
+esac

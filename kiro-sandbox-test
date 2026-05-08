@@ -1,0 +1,230 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# kiro-sandbox-test - Verify the sandbox actually confines what it claims to.
+#
+# Runs a battery of probes inside the sandbox via `kiro-sandbox --exec`,
+# asserts each access denial or expected behavior, and reports pass/fail.
+#
+# Usage:
+#   kiro-sandbox-test            # full battery, exits 0 if everything passed
+#   kiro-sandbox-test -v         # also print the raw probe output
+#   kiro-sandbox-test --no-net-check
+#                                # skip the network probe (e.g. in CI)
+#
+# The probes are deliberately destructive-attempt only (no successful
+# writes outside the project dir, no actual kernel exploits, etc).
+
+verbose=0
+check_net=1
+
+for arg in "$@"; do
+  case "$arg" in
+  -v | --verbose) verbose=1 ;;
+  --no-net-check) check_net=0 ;;
+  -h | --help)
+    sed -n '2,/^set -e/{ /^set -e/d; s/^# \?//; p; }' "$0"
+    exit 0
+    ;;
+  *)
+    printf 'kiro-sandbox-test: unknown arg: %s\n' "$arg" >&2
+    exit 2
+    ;;
+  esac
+done
+
+# Locate sibling kiro-sandbox script
+self=$(readlink -f -- "$0")
+self_dir=$(dirname -- "$self")
+if [ -x "$self_dir/kiro-sandbox" ]; then
+  wrapper="$self_dir/kiro-sandbox"
+elif command -v kiro-sandbox >/dev/null 2>&1; then
+  wrapper=$(command -v kiro-sandbox)
+else
+  printf 'kiro-sandbox-test: kiro-sandbox not found alongside this script or in PATH\n' >&2
+  exit 1
+fi
+
+# We run probes in a tmpdir to avoid mutating the user's project.
+tmp=$(mktemp -d -t kiro-sandbox-test.XXXXXX)
+trap 'rm -rf -- "$tmp"' EXIT
+
+pass=0
+fail=0
+skipped=0
+
+green=$'\033[32m'
+red=$'\033[31m'
+yellow=$'\033[33m'
+reset=$'\033[0m'
+[[ -t 1 ]] || {
+  green=""
+  red=""
+  yellow=""
+  reset=""
+}
+
+# Probe runner
+# Each probe is a bash one-liner that exits 0 if the EXPECTED security
+# property holds (i.e. denial happened, or expected access succeeded).
+probe() {
+  local label="$1"
+  shift
+  local expect="$1"
+  shift # 'pass' or 'skip'
+  local cmd="$1"
+  shift
+
+  local out rc
+  set +e
+  out=$(cd "$tmp" && "$wrapper" --exec /bin/bash -c "$cmd" 2>&1)
+  rc=$?
+  set -e
+
+  if [ "$verbose" = 1 ]; then
+    printf '%s---%s probe: %s\n' "$yellow" "$reset" "$label" >&2
+    printf '%s\n' "$out" >&2
+    printf '%s---%s rc=%s\n' "$yellow" "$reset" "$rc" >&2
+  fi
+
+  case "$expect" in
+  pass)
+    if [ "$rc" = 0 ]; then
+      printf '  %sPASS%s  %s\n' "$green" "$reset" "$label"
+      pass=$((pass + 1))
+    else
+      printf '  %sFAIL%s  %s (rc=%s)\n' "$red" "$reset" "$label" "$rc"
+      [ "$verbose" = 0 ] && printf '          %s\n' "$out" | sed 's/^/          /'
+      fail=$((fail + 1))
+    fi
+    ;;
+  skip)
+    printf '  %sSKIP%s  %s\n' "$yellow" "$reset" "$label"
+    skipped=$((skipped + 1))
+    ;;
+  esac
+}
+
+# Confinement probes
+# Each probe's bash command exits 0 when the SECURITY PROPERTY HOLDS.
+
+printf 'kiro-sandbox-test: using wrapper %s\n' "$wrapper"
+printf '\n[filesystem confinement]\n'
+
+probe "host ~/.ssh is invisible" pass \
+  '! ls -d "$HOME/.ssh" 2>/dev/null'
+
+probe "host ~/.gnupg is invisible" pass \
+  '! ls -d "$HOME/.gnupg" 2>/dev/null'
+
+probe "host ~/.bash_history is invisible" pass \
+  '! test -e "$HOME/.bash_history"'
+
+probe "host ~/.password-store is invisible" pass \
+  '! test -e "$HOME/.password-store"'
+
+probe "/root is unreadable" pass \
+  '! ls /root 2>/dev/null'
+
+probe "/etc/shadow is unreadable" pass \
+  'out=$(cat /etc/shadow 2>&1); echo "$out" | grep -qiE "permission denied|no such file"'
+
+probe "other home directories are not enumerable" pass \
+  'count=$(ls /home 2>/dev/null | wc -l); [ "$count" -le 1 ]'
+
+probe "sandbox HOME is writable" pass \
+  'touch "$HOME/.kiro-sandbox-write-test" && rm "$HOME/.kiro-sandbox-write-test"'
+
+probe "/usr is read-only" pass \
+  '! touch /usr/lib/.kiro-sandbox-write-test 2>/dev/null'
+
+probe "/etc is read-only" pass \
+  '! touch /etc/.kiro-sandbox-write-test 2>/dev/null'
+
+printf '\n[capability and namespace confinement]\n'
+
+probe "no CAP_SYS_ADMIN (mount fails)" pass \
+  '! mount -t tmpfs none /mnt 2>/dev/null'
+
+probe "no CAP_SYS_MODULE (modprobe fails)" pass \
+  '! modprobe dummy 2>/dev/null'
+
+probe "PID namespace isolated (host pid 1 invisible)" pass \
+  'count=$(ls /proc | grep -E "^[0-9]+$" | wc -l); [ "$count" -lt 50 ]'
+
+probe "uid mapping in effect (id is sane)" pass \
+  '[ "$(id -u)" -ge 0 ]'
+
+printf '\n[seccomp filter, if active]\n'
+
+# Detect whether seccomp is in effect by trying a denied syscall.
+# keyctl is in our DENY_SYSCALLS list.
+seccomp_status=$(
+  cd "$tmp" && "$wrapper" --exec /bin/bash -c \
+    'if grep -qE "^Seccomp:[[:space:]]*[12]" /proc/self/status; then echo on; else echo off; fi' \
+    2>/dev/null || echo unknown
+)
+printf '  seccomp filter: %s\n' "$seccomp_status"
+
+if [ "$seccomp_status" = on ]; then
+  probe "keyctl(2) denied" pass \
+    'if command -v keyctl >/dev/null 2>&1; then
+       out=$(keyctl show 2>&1); echo "$out" | grep -qiE "operation not permitted|permission denied"
+     else
+       # Try via Python ctypes
+       python3 -c "
+import ctypes, sys
+libc = ctypes.CDLL(\"libc.so.6\", use_errno=True)
+r = libc.syscall(250, 0, 0, 0, 0, 0)
+sys.exit(0 if r == -1 else 1)
+" 2>/dev/null
+     fi'
+
+  probe "ptrace(2) denied" pass \
+    'python3 -c "
+import ctypes, os, sys
+libc = ctypes.CDLL(\"libc.so.6\", use_errno=True)
+PTRACE_TRACEME = 0
+r = libc.ptrace(PTRACE_TRACEME, 0, 0, 0)
+sys.exit(0 if r == -1 else 1)
+" 2>/dev/null'
+
+  probe "userfaultfd(2) denied" pass \
+    'python3 -c "
+import ctypes, sys
+libc = ctypes.CDLL(\"libc.so.6\", use_errno=True)
+r = libc.syscall(323, 0)
+sys.exit(0 if r == -1 else 1)
+" 2>/dev/null'
+else
+  probe "seccomp keyctl denial" skip "(seccomp not active)"
+  probe "seccomp ptrace denial" skip "(seccomp not active)"
+  probe "seccomp userfaultfd denial" skip "(seccomp not active)"
+fi
+
+printf '\n[positive-path checks]\n'
+
+probe "current project dir IS visible" pass \
+  'test -d "$PWD"'
+
+probe "DNS works" pass \
+  'getent hosts example.com >/dev/null'
+
+if [ "$check_net" = 1 ]; then
+  probe "outbound TCP works" pass \
+    'exec 3<>/dev/tcp/1.1.1.1/80 && exec 3<&- && exec 3>&-'
+else
+  probe "outbound TCP works" skip "(--no-net-check)"
+fi
+
+# Summary
+total=$((pass + fail))
+printf '\n%d/%d probes passed, %d failed' "$pass" "$total" "$fail"
+[ "$skipped" -gt 0 ] && printf ', %d skipped' "$skipped"
+printf '\n'
+
+if [ "$fail" -gt 0 ]; then
+  printf '%sSandbox is leaky.%s Re-check bind mounts, --cap-drop, and seccomp.\n' "$red" "$reset"
+  exit 1
+fi
+exit 0

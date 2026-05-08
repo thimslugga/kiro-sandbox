@@ -1,0 +1,27 @@
+#!/bin/sh
+
+# kiro-sandbox-shell - Drop into a bash shell inside the same.
+#
+# bubblewrap sandbox view that kiro-cli would see.
+#
+# Useful for:
+#   - Inspecting what kiro-cli can and cannot reach
+#   - Verifying the sandbox view matches your expectations
+#   - Manually preparing files inside the project sandbox
+#   - Testing seccomp denials interactively
+#
+# Equivalent to: kiro-sandbox --shell
+# All KIRO_SANDBOX_* environment variables are honored.
+
+# Resolve and dispatch. Use realpath if available so symlinks work.
+self=$(readlink -f -- "$0" 2>/dev/null || printf '%s' "$0")
+dir=$(dirname -- "$self")
+
+if [ -x "$dir/kiro-sandbox" ]; then
+  exec "$dir/kiro-sandbox" --shell "$@"
+elif command -v kiro-sandbox >/dev/null 2>&1; then
+  exec kiro-sandbox --shell "$@"
+else
+  printf 'kiro-sandbox-shell: kiro-sandbox not found alongside this script or in PATH\n' >&2
+  exit 1
+fi

@@ -1,0 +1,137 @@
+---
+# deploy.yml -- install kiro-sandbox system-wide on a fleet of hosts.
+#
+# Tested on:
+#   - Amazon Linux 2023
+#
+# Run with:
+#   ansible-playbook -i inventory.ini deploy.yml
+#
+# Variables you may want to override (-e var=value or in inventory):
+#   sandbox_install_dir   default /usr/local/bin
+#   sandbox_share_dir     default /usr/local/share/kiro-sandbox
+#   sandbox_install_seccomp  default true
+#   sandbox_source_dir    default ../  (relative to this playbook)
+
+- name: Install kiro-sandbox
+  hosts: kiro_sandbox_hosts
+  become: true
+  gather_facts: true
+
+  vars:
+    sandbox_install_dir: /usr/local/bin
+    sandbox_share_dir: /usr/local/share/kiro-sandbox
+    sandbox_install_seccomp: true
+    sandbox_source_dir: "{{ playbook_dir }}/.."
+
+    sandbox_scripts:
+      - kiro-sandbox
+      - kiro-sandbox-shell
+      - kiro-sandbox-test
+      - kiro-sandbox-seccomp
+
+    package_map:
+      Debian:
+        bubblewrap: bubblewrap
+        seccomp: python3-seccomp
+      RedHat:
+        bubblewrap: bubblewrap
+        seccomp: python3-libseccomp
+
+  pre_tasks:
+    - name: Verify kernel supports unprivileged user namespaces
+      ansible.builtin.command:
+        cmd: unshare --user --pid /bin/true
+      register: userns_check
+      changed_when: false
+      failed_when: false
+
+    - name: Fail if user namespaces are unavailable
+      ansible.builtin.fail:
+        msg: |
+          Unprivileged user namespaces are disabled on this kernel.
+          kiro-sandbox requires CONFIG_USER_NS=y and (on some distros)
+          kernel.unprivileged_userns_clone=1. Cannot proceed.
+      when: userns_check.rc != 0
+
+    - name: Detect package family
+      ansible.builtin.assert:
+        that: ansible_os_family in package_map
+        fail_msg: "Unsupported OS family: {{ ansible_os_family }}"
+
+  tasks:
+    - name: Install bubblewrap (Debian family)
+      ansible.builtin.apt:
+        name: "{{ package_map[ansible_os_family]['bubblewrap'] }}"
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+      when: ansible_os_family == 'Debian'
+
+    - name: Install bubblewrap (Red Hat family)
+      ansible.builtin.dnf:
+        name: "{{ package_map[ansible_os_family]['bubblewrap'] }}"
+        state: present
+      when: ansible_os_family == 'RedHat'
+
+    - name: Install libseccomp Python bindings (Debian family)
+      ansible.builtin.apt:
+        name: "{{ package_map[ansible_os_family]['seccomp'] }}"
+        state: present
+      when:
+        - sandbox_install_seccomp | bool
+        - ansible_os_family == 'Debian'
+
+    - name: Install libseccomp Python bindings (Red Hat family)
+      ansible.builtin.dnf:
+        name: "{{ package_map[ansible_os_family]['seccomp'] }}"
+        state: present
+      when:
+        - sandbox_install_seccomp | bool
+        - ansible_os_family == 'RedHat'
+
+    - name: Ensure share directory exists
+      ansible.builtin.file:
+        path: "{{ sandbox_share_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+
+    - name: Install kiro-sandbox scripts
+      ansible.builtin.copy:
+        src: "{{ sandbox_source_dir }}/{{ item }}"
+        dest: "{{ sandbox_install_dir }}/{{ item }}"
+        owner: root
+        group: root
+        mode: '0755'
+      loop: "{{ sandbox_scripts }}"
+
+    - name: Install sample audit-logging agent definition
+      ansible.builtin.copy:
+        src: "{{ sandbox_source_dir }}/agents/sandbox-default.json"
+        dest: "{{ sandbox_share_dir }}/sandbox-default.json"
+        owner: root
+        group: root
+        mode: '0644'
+
+  post_tasks:
+    - name: Verify kiro-sandbox is callable
+      ansible.builtin.command:
+        cmd: "{{ sandbox_install_dir }}/kiro-sandbox --help"
+      register: help_check
+      changed_when: false
+
+    - name: Show install summary
+      ansible.builtin.debug:
+        msg: |
+          kiro-sandbox installed.
+          Scripts:    {{ sandbox_install_dir }}
+          Agent def:  {{ sandbox_share_dir }}/sandbox-default.json
+          Seccomp:    {{ 'enabled' if sandbox_install_seccomp else 'disabled' }}
+
+          Each user must still log in to Kiro inside their own sandbox:
+            kiro-sandbox login
+
+          Then verify confinement:
+            kiro-sandbox-test
