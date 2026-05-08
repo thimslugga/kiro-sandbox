@@ -92,7 +92,7 @@ esac
 
 # Requirements
 command -v bwrap >/dev/null 2>&1 || die "bwrap not found. Install bubblewrap: dnf install bubblewrap"
-command -v python3 >/dev/null 2>&1 || die "bwrap not found. Install python: dnf install python3"
+command -v python3 >/dev/null 2>&1 || die "python3 not found. Install python3: dnf install python3"
 
 kiro_bin=$(command -v kiro-cli 2>/dev/null || true)
 if [ "$mode" = run ]; then
